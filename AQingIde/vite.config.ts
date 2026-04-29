@@ -1,0 +1,40 @@
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+
+// @ts-expect-error process is a nodejs global
+const host = process.env.TAURI_DEV_HOST;
+
+// https://vite.dev/config/
+export default defineConfig(async () => ({
+  plugins: [react(), tailwindcss()],
+
+  // Monaco Editor 本地加载优化
+  optimizeDeps: {
+    include: [
+      "monaco-editor/esm/vs/language/json/json.worker",
+      "monaco-editor/esm/vs/language/css/css.worker",
+      "monaco-editor/esm/vs/language/html/html.worker",
+      "monaco-editor/esm/vs/language/typescript/ts.worker",
+      "monaco-editor/esm/vs/editor/editor.worker",
+    ],
+  },
+
+  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
+  clearScreen: false,
+  server: {
+    port: 1420,
+    strictPort: true,
+    host: host || false,
+    hmr: host
+      ? {
+          protocol: "ws",
+          host,
+          port: 1421,
+        }
+      : undefined,
+    watch: {
+      ignored: ["**/src-tauri/**"],
+    },
+  },
+}));

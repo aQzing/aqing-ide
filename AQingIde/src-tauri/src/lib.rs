@@ -332,7 +332,8 @@ mod commands {
     }
 
     #[tauri::command]
-    pub fn write_file_content(path: String, content: String) -> Result<(), String> {
+    pub fn write_file_content(app: AppHandle, path: String, content: String) -> Result<(), String> {
+        use tauri::Emitter;
         let file_path = Path::new(&path);
         if let Some(parent) = file_path.parent() {
             if !parent.exists() {
@@ -340,7 +341,10 @@ mod commands {
                     .map_err(|e| format!("创建目录失败: {}", e))?;
             }
         }
-        fs::write(file_path, content).map_err(|e| format!("写入文件失败: {}", e))
+        fs::write(file_path, &content).map_err(|e| format!("写入文件失败: {}", e))?;
+        // 写入成功后通知前端文件系统已变更，触发资源管理器刷新
+        let _ = app.emit("file-system-changed", path);
+        Ok(())
     }
 
     #[tauri::command]
@@ -759,6 +763,96 @@ mod commands {
         }
     }
 
+    /// 复制文件/目录到目标目录，自动处理同名冲突（追加 " (copy)" 或 " (copy N)"）
+    /// 返回实际写入的目标路径
+    #[tauri::command]
+    pub fn copy_path_safe(src_path: String, dest_dir: String) -> Result<String, String> {
+        let src = Path::new(&src_path);
+        if !src.exists() {
+            return Err(format!("源路径不存在: {}", src_path));
+        }
+        let dest_dir_path = Path::new(&dest_dir);
+        if !dest_dir_path.is_dir() {
+            return Err(format!("目标不是目录: {}", dest_dir));
+        }
+
+        // 计算不冲突的目标路径
+        let dest = resolve_no_conflict(src, dest_dir_path);
+        let dest_str = dest.to_string_lossy().replace('\\', "/");
+
+        if src.is_dir() {
+            copy_dir_recursive(src, &dest).map_err(|e| format!("复制目录失败: {}", e))?;
+        } else {
+            copy_file_shared(src, &dest).map_err(|e| format!("复制文件失败: {}", e))?;
+        }
+        Ok(dest_str)
+    }
+
+    /// 移动文件/目录到目标目录，自动处理同名冲突
+    /// 返回实际写入的目标路径
+    #[tauri::command]
+    pub fn move_path_safe(src_path: String, dest_dir: String) -> Result<String, String> {
+        let src = Path::new(&src_path);
+        if !src.exists() {
+            return Err(format!("源路径不存在: {}", src_path));
+        }
+        let dest_dir_path = Path::new(&dest_dir);
+        if !dest_dir_path.is_dir() {
+            return Err(format!("目标不是目录: {}", dest_dir));
+        }
+
+        // 如果源和目标在同一目录，直接返回（不做任何操作）
+        if let Some(src_parent) = src.parent() {
+            if src_parent == dest_dir_path {
+                return Ok(src_path.replace('\\', "/"));
+            }
+        }
+
+        let dest = resolve_no_conflict(src, dest_dir_path);
+        let dest_str = dest.to_string_lossy().replace('\\', "/");
+        fs::rename(src, &dest).map_err(|e| format!("移动失败: {}", e))?;
+        Ok(dest_str)
+    }
+
+    /// 计算不与目标目录中已有文件冲突的路径
+    /// 规则：foo.ts → foo (copy).ts → foo (copy 2).ts → ...
+    fn resolve_no_conflict(src: &Path, dest_dir: &Path) -> std::path::PathBuf {
+        let file_name = src.file_name().unwrap_or_default().to_string_lossy();
+        let is_dir = src.is_dir();
+
+        // 分离 stem 和 extension
+        let (stem, ext) = if is_dir {
+            (file_name.to_string(), String::new())
+        } else {
+            let p = std::path::Path::new(file_name.as_ref());
+            let s = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let e = p.extension().map(|x| format!(".{}", x.to_string_lossy())).unwrap_or_default();
+            (s, e)
+        };
+
+        // 先尝试原名
+        let candidate = dest_dir.join(format!("{}{}", stem, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+
+        // 追加 " (copy)"
+        let candidate = dest_dir.join(format!("{} (copy){}", stem, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+
+        // 追加 " (copy N)"
+        let mut n = 2u32;
+        loop {
+            let candidate = dest_dir.join(format!("{} (copy {}){}", stem, n, ext));
+            if !candidate.exists() {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
     /// Windows 下以宽松共享模式复制文件，避免 os error 32（共享冲突）
     fn copy_file_shared(src: &Path, dest: &Path) -> std::io::Result<()> {
         #[cfg(windows)]
@@ -1046,6 +1140,8 @@ pub fn run() {
             commands::rename_path,
             commands::delete_path,
             commands::copy_path,
+            commands::copy_path_safe,
+            commands::move_path_safe,
             commands::reveal_in_explorer,
             commands::terminal_execute,
             commands::ai_agent_step,

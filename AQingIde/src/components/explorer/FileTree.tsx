@@ -1,8 +1,10 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import type { ExplorerState, FileNode } from "../../store/explorerStore";
-import { FileTreeNode, getClipboard, setClipboard } from "./FileTreeNode";
+import { FileTreeNode } from "./FileTreeNode";
+import { ClipboardProvider, useClipboard } from "./ClipboardContext";
 
 interface FileTreeProps {
   explorer: ExplorerState;
@@ -21,21 +23,62 @@ function getAncestorPaths(filePath: string): string[] {
   return ancestors;
 }
 
-// 将路径统一为正斜杠小写用于比较
 function normPath(p: string) {
   return p.replace(/\\/g, "/");
 }
 
-const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePath }) => {
+function getParentPath(filePath: string): string {
+  const normalized = normPath(filePath);
+  return normalized.split("/").slice(0, -1).join("/");
+}
+
+function findNodePath(nodes: FileNode[], normalizedTarget: string): string | null {
+  for (const node of nodes) {
+    if (normPath(node.path) === normalizedTarget) return node.path;
+    if (node.children) {
+      const found = findNodePath(node.children, normalizedTarget);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function findNode(nodes: FileNode[], path: string): FileNode | null {
+  for (const node of nodes) {
+    if (normPath(node.path) === normPath(path)) return node;
+    if (node.children) {
+      const found = findNode(node.children, path);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// ─── 判断当前焦点是否在编辑器区域（Monaco 等），避免劫持快捷键 ────────────────
+
+function isFocusInEditor(): boolean {
+  const el = document.activeElement;
+  if (!el) return false;
+  // Monaco 编辑器的 textarea / contenteditable div
+  if (el instanceof HTMLTextAreaElement) return true;
+  if (el instanceof HTMLInputElement) return true;
+  // Monaco 用 div[role="textbox"] 或 .monaco-editor 内的元素
+  if (el.closest(".monaco-editor")) return true;
+  if (el.closest(".xterm")) return true; // 终端
+  return false;
+}
+
+// ─── 内部组件（需要访问 ClipboardContext）────────────────────────────────────
+
+const FileTreeInner: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePath }) => {
   const { rootPath, rootNodes } = explorer;
+  const { clipboard, setClipboard, clearClipboard } = useClipboard();
   const [creating, setCreating] = useState<"file" | "dir" | null>(null);
   const [createValue, setCreateValue] = useState("");
   const createInputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  // 根目录右键菜单
   const [rootContextMenu, setRootContextMenu] = useState<{ x: number; y: number } | null>(null);
   const rootMenuRef = useRef<HTMLDivElement>(null);
-  // 当前选中的节点路径（用于键盘快捷键操作）
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
 
   useEffect(() => {
@@ -44,7 +87,6 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
     }
   }, [creating]);
 
-  // 关闭根目录右键菜单
   useEffect(() => {
     if (!rootContextMenu) return;
     const handler = (e: MouseEvent) => {
@@ -65,6 +107,26 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
       console.error("刷新失败:", err);
     }
   };
+
+  // 监听 Rust 端 write_file_content 发出的 file-system-changed 事件，自动刷新文件树
+  useEffect(() => {
+    if (!rootPath) return;
+    let unlisten: UnlistenFn | null = null;
+    listen<string>("file-system-changed", () => {
+      void (async () => {
+        try {
+          const nodes = await invoke<FileNode[]>("read_directory", { path: rootPath });
+          explorer.setRootNodes(nodes);
+        } catch (err) {
+          console.error("file-system-changed 刷新失败:", err);
+        }
+      })();
+    })
+      .then((fn) => { unlisten = fn; })
+      .catch((err) => console.error("listen file-system-changed 失败:", err));
+    return () => { unlisten?.(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rootPath]);
 
   const handleStartCreate = (type: "file" | "dir") => {
     setCreateValue("");
@@ -90,17 +152,14 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
     }
   };
 
-  // 定位当前文件：展开所有父目录，然后滚动到对应节点
+  // 定位当前文件
   const handleRevealActiveFile = useCallback(async () => {
     if (!activeFilePath || !rootPath) return;
     const ancestors = getAncestorPaths(activeFilePath);
-    // 展开所有父目录（如果还没展开）
     for (const ancestor of ancestors) {
-      // 找到对应的原始路径（可能是反斜杠）
       const matchedPath = findNodePath(rootNodes, ancestor);
       if (matchedPath && !explorer.isExpanded(matchedPath)) {
         explorer.toggleExpand(matchedPath);
-        // 如果子节点未加载，加载它
         const node = findNode(rootNodes, matchedPath);
         if (node && (!node.children || node.children.length === 0)) {
           try {
@@ -110,7 +169,6 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
         }
       }
     }
-    // 等待 DOM 更新后滚动
     setTimeout(() => {
       if (!scrollContainerRef.current) return;
       const normalizedActive = normPath(activeFilePath);
@@ -121,51 +179,61 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
     }, 100);
   }, [activeFilePath, rootPath, rootNodes, explorer]);
 
-  // 键盘快捷键（Ctrl+C/X/V/Delete），需要焦点在文件树容器内
+  // ─── 键盘快捷键（仅在文件树区域有焦点时生效）────────────────────────────────
+
   const handleKeyDown = useCallback(async (e: KeyboardEvent) => {
+    // 如果焦点在编辑器/终端/输入框，不劫持
+    if (isFocusInEditor()) return;
     if (!selectedPath) return;
-    // 不处理输入框内的事件
-    if (document.activeElement instanceof HTMLInputElement) return;
 
     if (e.ctrlKey && e.key === "c") {
       e.preventDefault();
-      const name = selectedPath.replace(/\\/g, "/").split("/").pop() ?? selectedPath;
+      const name = normPath(selectedPath).split("/").pop() ?? selectedPath;
       setClipboard({ type: "copy", path: selectedPath, name });
     } else if (e.ctrlKey && e.key === "x") {
       e.preventDefault();
-      const name = selectedPath.replace(/\\/g, "/").split("/").pop() ?? selectedPath;
+      const name = normPath(selectedPath).split("/").pop() ?? selectedPath;
       setClipboard({ type: "cut", path: selectedPath, name });
     } else if (e.ctrlKey && e.key === "v") {
+      if (!clipboard || !rootPath) return;
       e.preventDefault();
-      const cb = getClipboard();
-      if (!cb || !rootPath) return;
-      // 粘贴目标：如果选中的是目录则粘贴进去，否则粘贴到同级
+
       const node = findNode(rootNodes, selectedPath);
-      const pasteDir = (node && node.is_dir) ? selectedPath : getParentPath(selectedPath);
-      const sep = pasteDir.includes("\\") ? "\\" : "/";
-      const destPath = pasteDir.replace(/[/\\]$/, "") + sep + cb.name;
-      const ok = window.confirm(`确认要粘贴「${cb.name}」到此位置吗？\n${destPath}`);
-      if (!ok) return;
-      try {
-        if (cb.type === "cut") {
-          await invoke("rename_path", { oldPath: cb.path, newPath: destPath });
-          explorer.removeNode(cb.path);
-          setClipboard(null);
-        } else {
-          await invoke("copy_path", { srcPath: cb.path, destPath });
+      const pasteDir = (node && node.is_dir) ? normPath(selectedPath) : getParentPath(selectedPath);
+
+      // 防止移动到自身子目录
+      if (clipboard.type === "cut") {
+        const srcNorm = normPath(clipboard.path);
+        if (srcNorm === pasteDir || pasteDir.startsWith(srcNorm + "/")) {
+          alert("不能将文件夹移动到自身或其子目录中");
+          return;
         }
-        const children = await invoke<FileNode[]>("read_directory", { path: pasteDir });
-        if (node && node.is_dir) {
-          explorer.updateChildren(selectedPath, children);
+      }
+
+      try {
+        if (clipboard.type === "cut") {
+          await invoke<string>("move_path_safe", { srcPath: clipboard.path, destDir: pasteDir });
+          explorer.removeNode(clipboard.path);
+          clearClipboard();
         } else {
-          explorer.updateChildren(pasteDir, children);
+          await invoke<string>("copy_path_safe", { srcPath: clipboard.path, destDir: pasteDir });
+        }
+        // 刷新目标目录
+        const children = await invoke<FileNode[]>("read_directory", { path: pasteDir });
+        explorer.updateChildren(pasteDir, children);
+        // 如果目标是折叠的目录，展开它
+        if (node && node.is_dir && !explorer.isExpanded(node.path)) {
+          explorer.toggleExpand(node.path);
         }
       } catch (err) {
         alert(`粘贴失败: ${err}`);
       }
+    } else if (e.key === "F2") {
+      // F2 重命名（由 FileTreeNode 内部处理，这里只做选中节点的触发）
+      // 暂不在此处理，由节点右键菜单触发
     } else if (e.key === "Delete") {
       e.preventDefault();
-      const name = selectedPath.replace(/\\/g, "/").split("/").pop() ?? selectedPath;
+      const name = normPath(selectedPath).split("/").pop() ?? selectedPath;
       const confirmed = await confirm(
         `确定要删除「${name}」吗？此操作不可撤销。`,
         { title: "删除确认", kind: "warning" }
@@ -179,7 +247,7 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
         alert(`删除失败: ${err}`);
       }
     }
-  }, [selectedPath, rootPath, rootNodes, explorer]);
+  }, [selectedPath, rootPath, rootNodes, explorer, clipboard, setClipboard, clearClipboard]);
 
   useEffect(() => {
     window.addEventListener("keydown", handleKeyDown);
@@ -269,6 +337,35 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
         </button>
       </div>
 
+      {/* 剪贴板状态提示条 */}
+      {clipboard && (
+        <div style={{
+          padding: "3px 12px",
+          fontSize: "11px",
+          color: "#888",
+          backgroundColor: "#1e1e1e",
+          borderBottom: "1px solid #333",
+          display: "flex",
+          alignItems: "center",
+          gap: "6px",
+          flexShrink: 0,
+        }}>
+          <span style={{ color: clipboard.type === "cut" ? "#e8c07d" : "#4ec9b0" }}>
+            {clipboard.type === "cut" ? "✂" : "⧉"}
+          </span>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+            {clipboard.name}
+          </span>
+          <button
+            onClick={clearClipboard}
+            style={{ background: "none", border: "none", color: "#666", cursor: "pointer", padding: "0 2px", fontSize: "12px" }}
+            title="清除剪贴板"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* 根目录名称 */}
       <div style={{ padding: "2px 12px 6px", color: "#cccccc", fontSize: "11px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", flexShrink: 0, borderBottom: "1px solid #1e1e1e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={rootPath}>
         {rootName}
@@ -327,32 +424,12 @@ const FileTree: React.FC<FileTreeProps> = ({ explorer, onOpenFile, activeFilePat
   );
 };
 
-// 在节点树中查找与 normalizedPath 匹配的原始路径
-function findNodePath(nodes: FileNode[], normalizedTarget: string): string | null {
-  for (const node of nodes) {
-    if (normPath(node.path) === normalizedTarget) return node.path;
-    if (node.children) {
-      const found = findNodePath(node.children, normalizedTarget);
-      if (found) return found;
-    }
-  }
-  return null;
-}
+// ─── 导出：包裹 ClipboardProvider ─────────────────────────────────────────────
 
-function findNode(nodes: FileNode[], path: string): FileNode | null {
-  for (const node of nodes) {
-    if (node.path === path) return node;
-    if (node.children) {
-      const found = findNode(node.children, path);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-function getParentPath(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, "/");
-  return normalized.split("/").slice(0, -1).join("/");
-}
+const FileTree: React.FC<FileTreeProps> = (props) => (
+  <ClipboardProvider>
+    <FileTreeInner {...props} />
+  </ClipboardProvider>
+);
 
 export default FileTree;

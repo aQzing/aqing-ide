@@ -1,0 +1,6 @@
+- [Windows Rust 链接器冲突](project_rust_linker_issue.md) — Git GNU link.exe 优先于 MSVC，系统无 VS Build Tools，cargo check 失败
+- [AQingCode 项目用户背景](user_profile.md) — 用户构建 AI 原生桌面 IDE，Tauri 2.0 + React 19 + Monaco Editor
+- [Phase 3-5 实现状态](project_phase3_5_status.md) — AI 配置/Ghost Text/Chat 面板已完成，关键架构和新增文件记录
+- [Phase 6 实现状态](project_phase6_status.md) — AI 右键菜单/斜杠命令已完成，props 提升通信架构记录
+- [文件树剪贴板架构](project_clipboard_arch.md) — ClipboardContext 替代模块级变量，Rust 端 copy_path_safe/move_path_safe 处理冲突
+- [ChatPanel 三大功能增强](project_chat_enhancements.md) — 代码块复制/消息时间戳/任务规划+Diff 展示，2026-04-13 完成
